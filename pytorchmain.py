@@ -17,12 +17,12 @@ num_gate_types = 4
 num_possible_inputs = num_gates + 8  # 2 inputs, 4 bits each
 
 def create_model():
-    gate_probs = torch.rand((num_gates, num_gate_types), dtype=torch.float32, requires_grad=True, device=device)
+    gate_probs = torch.rand((num_gates, num_gate_types-1), dtype=torch.float32, requires_grad=True, device=device)
     base_layers = [gate_probs]
     for i in range(num_gates):
         valid_inputs = i + 8
-        base_layers.append(torch.rand((num_gate_types, valid_inputs), dtype=torch.float32, device=device, requires_grad=True))
-        base_layers.append(torch.rand((num_gate_types, valid_inputs), dtype=torch.float32, device=device, requires_grad=True))
+        base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
+        base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
     return base_layers
 
 losses = []
@@ -63,9 +63,10 @@ parser.add_argument('--checkpoint', type=str, default=None, help="Path to a chec
 parser.add_argument('--new', action='store_true', help="Start a new model from scratch")
 args = parser.parse_args()
 
-learning_rate = .05
-num_epochs = 120000
+learning_rate = .01
+num_epochs = 10000
 
+optim = torch.optim.AdamW
 optim_args = {
     "lr": learning_rate,
     #"fused": True,
@@ -76,24 +77,24 @@ if args.new or not args.checkpoint:
     base_layers = create_model()
     losses = []
     start_epoch = 0
-    optimizer = torch.optim.Adam(base_layers, **optim_args)
+    optimizer = optim(base_layers, **optim_args)
 else:
     base_layers = create_model()
-    optimizer = torch.optim.Adam(base_layers, **optim_args)
+    optimizer = optim(base_layers, **optim_args)
     if args.checkpoint and os.path.exists(args.checkpoint):
         with torch.no_grad():
             start_epoch, losses = load_checkpoint(args.checkpoint, base_layers, optimizer)
     else:
         start_epoch = 0
 
-optimizer = torch.optim.RMSprop(base_layers, **optim_args)
+#optimizer = optim(base_layers, **optim_args)
 param_count = sum(param.numel() for param in base_layers)
 print("Parameters:", param_count)
 
 for epoch in (pbar := trange(start_epoch, num_epochs, desc="Training Epochs")):
     optimizer.zero_grad(set_to_none=True)
 
-    loss = evaluate_instance(base_layers, generate_inputs, correct_behavior)
+    loss = evaluate_instance(base_layers, generate_inputs, correct_behavior, dropout=.0)
 
     loss.backward()
 

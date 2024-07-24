@@ -2,16 +2,29 @@
 import numpy as np
 import torch
 
-def evaluate_instance(original_layers, generate_inputs_fn: callable, correct_behavior_fn: callable, input_len: int = 8) -> torch.Tensor:
-    layers = []
-    for layer in original_layers:
-        newlayer = torch.nn.functional.normalize(torch.sigmoid(5*(layer-.5)), p=1, dim=1)
-        layers.append(newlayer)
+def normalize_layers(layers, dropout):
+    new_layers = []
+    for layer in layers:
+        clamped = torch.sigmoid(5 * (layer - 0.5))
+        extended = torch.cat([clamped, torch.clamp(1 - torch.sum(clamped, dim=1), 0, 1).unsqueeze(1)], dim=1)
+        if dropout:
+            extended = torch.nn.functional.dropout(extended, dropout)
+        normalized = torch.nn.functional.normalize(extended, p=1, dim=1)
+        new_layers.append(normalized)
+    return new_layers
 
+def compute_gate_results(i1, i2):
+    AND = i1[0] * i2[0]
+    OR = i1[1] + i2[1] - i1[1] * i2[1]
+    XOR = i2[2] + i1[2] - 2 * i1[2] * i2[2]
+    NOT = 1 - i1[3]
+    return torch.stack([AND, OR, XOR, NOT], dim=1)
+
+def evaluate_instance(original_layers, generate_inputs_fn: callable, correct_behavior_fn: callable, dropout: float = .0, input_len: int = 8) -> torch.Tensor:
+    layers = normalize_layers(original_layers, dropout)
     gate_probs = layers[0]
     inputs = layers[1:]
-    input1s = inputs[::2]
-    input2s = inputs[1::2]
+    input1s, input2s = inputs[::2], inputs[1::2]
     num_gates = gate_probs.shape[0]
 
     NUM_TESTS = 256
@@ -20,21 +33,10 @@ def evaluate_instance(original_layers, generate_inputs_fn: callable, correct_beh
     outputs = sample_inputs
 
     for i in range(num_gates):
-        i1 = torch.matmul(input1s[i], outputs.T)
-        i2 = torch.matmul(input2s[i], outputs.T)
-
-        # Vectorized gate predictions
-        AND = i1[0] * i2[0]
-        OR = i1[1] + i2[1] - i1[1] * i2[1]
-        XOR = i2[2] + i1[2] - 2 * i1[2] * i2[2]
-        NOT = 1 - i1[3]
-
-        gate_results = torch.stack([AND, OR, XOR, NOT], dim=1)
-
+        i1, i2 = torch.matmul(input1s[i], outputs.T), torch.matmul(input2s[i], outputs.T)
+        gate_results = compute_gate_results(i1, i2)
         result = gate_results @ gate_probs[i]
-        result = result.unsqueeze(1)
-
-        outputs = torch.cat((outputs, result), dim=1)
+        outputs = torch.cat((outputs, result.unsqueeze(1)), dim=1)
 
     expected_outputs = correct_behavior_fn(sample_inputs, (NUM_TESTS, input_len // 2))
     m = expected_outputs.shape[0]
@@ -42,32 +44,14 @@ def evaluate_instance(original_layers, generate_inputs_fn: callable, correct_beh
     actual_outputs = outputs[-m:, -n:]
     #print("Given:", actual_outputs, "Correct:", expected_outputs, sep="\n")
     #loss = torch.sum(torch.sum(torch.abs(actual_outputs - expected_outputs), dim=1) ** 2)
-    #loss = torch.sum((actual_outputs - expected_outputs) ** 2)
-    loss = torch.sum(torch.sigmoid(8*(torch.abs(actual_outputs-expected_outputs) - .5)))
+    loss = torch.sum((actual_outputs - expected_outputs) ** 2)
+    #loss = torch.sum(torch.sigmoid(8*(torch.abs(actual_outputs-expected_outputs) - 1)))
     #loss = torch.sum(torch.abs(actual_outputs - expected_outputs) ** 3)
     # penalize gates that are between 0 and 1
     #all_layers = torch.cat(layers[1:], dim=1)
     #loss = loss + torch.sum(gate_probs*(1-gate_probs)) + torch.sum(all_layers*(1-all_layers))
 
     return loss
-
-def predict_gate(gate_type: int, input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
-    if gate_type == 0:
-        return input1 * input2
-    elif gate_type == 1:
-        return input1 + input2 - input1 * input2
-    elif gate_type == 2:
-        return 1 - input1
-    elif gate_type == 3:
-        return 1 - (input1 * input2)
-    elif gate_type == 4:
-        return (1 - input1) * (1 - input2)
-    elif gate_type == 5:
-        return (1 - input1) * input2 + input1 * (1 - input2)
-    elif gate_type == 6:
-        return 1 - ((1 - input1) * input2 + input1 * (1 - input2))
-    else:
-        raise ValueError(f"Invalid gate type: {gate_type}")
 
 def correct_behavior(inputs, shape):
     device = inputs.device
