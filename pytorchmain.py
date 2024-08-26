@@ -17,10 +17,9 @@ num_gate_types = 4
 num_possible_inputs = num_gates + 8  # 2 inputs, 4 bits each
 
 def create_model():
-    gate_probs = torch.rand((num_gates, num_gate_types-1), dtype=torch.float32, requires_grad=True, device=device)
-    base_layers = [gate_probs]
+    base_layers = []
     for i in range(num_gates):
-        valid_inputs = i + 8
+        valid_inputs = i*4 + 8
         base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
         base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
     return base_layers
@@ -63,13 +62,13 @@ parser.add_argument('--checkpoint', type=str, default=None, help="Path to a chec
 parser.add_argument('--new', action='store_true', help="Start a new model from scratch")
 args = parser.parse_args()
 
-learning_rate = .01
-num_epochs = 10000
+learning_rate = .005
+num_epochs = 40000
 
-optim = torch.optim.AdamW
+optim = torch.optim.Adam
 optim_args = {
     "lr": learning_rate,
-    #"fused": True,
+    "fused": True,
     #"rho": 0.95,
 }
 
@@ -94,7 +93,7 @@ print("Parameters:", param_count)
 for epoch in (pbar := trange(start_epoch, num_epochs, desc="Training Epochs")):
     optimizer.zero_grad(set_to_none=True)
 
-    loss = evaluate_instance(base_layers, generate_inputs, correct_behavior, dropout=.0)
+    loss, mse = evaluate_instance(base_layers, num_gates, generate_inputs, correct_behavior, dropout=.0)
 
     loss.backward()
 
@@ -106,12 +105,12 @@ for epoch in (pbar := trange(start_epoch, num_epochs, desc="Training Epochs")):
     for param in base_layers:
         grad_magn += torch.sum(torch.abs(param.grad))
 
-    pbar.set_description(f"Epoch {epoch}: loss = {loss.item():.4f}; grad magn.: {grad_magn:.4f}")
+    pbar.set_description(f"Epoch {epoch}: mse = {mse.item():.4f}; grad magn.: {grad_magn:.4f}")
 
     if epoch % 50 == 0 and epoch != start_epoch:
         losses.append(loss.item())
         with open("output.json", "w") as f:
-            f.write(json.dumps(parse_gate_configuration(base_layers)))
+            f.write(json.dumps(parse_gate_configuration(base_layers, num_gates, num_gate_types)))
         save_checkpoint(epoch, base_layers, optimizer, losses)
 
 print("Final Instance (gate_probs):\n", base_layers[0])

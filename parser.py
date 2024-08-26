@@ -6,16 +6,14 @@ import json
 
 torch.set_printoptions(sci_mode=False, linewidth=500)
 
-def parse_gate_configuration(base_layers):
-    gate_probs = base_layers[0]
+def parse_gate_configuration(base_layers, num_gates, num_gate_types):
     input1_layers = base_layers[::2]
     input2_layers = base_layers[1::2]
-    num_gates = gate_probs.shape[0]
 
     gates = []
 
     for i in range(num_gates):
-        gate_type = torch.argmax(gate_probs[i]).item()
+        gate_type = i % num_gate_types
         input1_index = torch.argmax(input1_layers[i][gate_type]).item()
         input2_index = torch.argmax(input2_layers[i][gate_type]).item()
 
