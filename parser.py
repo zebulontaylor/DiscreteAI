@@ -7,20 +7,15 @@ import json
 torch.set_printoptions(sci_mode=False, linewidth=500)
 
 def parse_gate_configuration(base_layers, num_gates, num_gate_types):
-    input1_layers = base_layers[::2]
-    input2_layers = base_layers[1::2]
-
     gates = []
 
     for i in range(num_gates):
         gate_type = i % num_gate_types
-        input1_index = torch.argmax(input1_layers[i][gate_type]).item()
-        input2_index = torch.argmax(input2_layers[i][gate_type]).item()
+        input_index = torch.topk(base_layers[i][gate_type], 2).indices.tolist()
 
         gates.append({
             'gate_type': gate_type,
-            'input1': input1_index,
-            'input2': input2_index
+            'input1': input_index
         })
 
     return gates
@@ -92,11 +87,7 @@ def load_checkpoint(checkpoint_path):
     return base_layers
 
 def print_layer_probabilities(base_layers):
-    gate_probs = base_layers[0]
-    print("Gate Probabilities:")
-    print(gate_probs)
-
-    for idx, layer in enumerate(base_layers[1:], start=1):
+    for idx, layer in enumerate(base_layers):
         input("")
         print(f"Layer {idx}:")
         print(layer)
@@ -110,12 +101,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     base_layers = load_checkpoint(args.checkpoint)
+
+    if args.show_layers:
+        print_layer_probabilities(base_layers)
+
     gates = parse_gate_configuration(base_layers)
 
     print("Gate Configuration:")
     for gate in gates:
         print(f"Gate Type: {gate['gate_type']}, Input1: {gate['input1']}, Input2: {gate['input2']}")
 
-    if args.show_layers:
-        print_layer_probabilities(base_layers)
     create_graph(gates, prune_leaves=args.prune_leaves)

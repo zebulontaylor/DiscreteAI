@@ -12,7 +12,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 print(f"Running pytorch on {'cuda' if torch.cuda.is_available() else 'cpu'}.")
 
-num_gates = 12
+num_gates = 20
 num_gate_types = 4
 num_possible_inputs = num_gates + 8  # 2 inputs, 4 bits each
 
@@ -21,12 +21,11 @@ def create_model():
     for i in range(num_gates):
         valid_inputs = i*4 + 8
         base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
-        base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
     return base_layers
 
 losses = []
 
-torch.autograd.set_detect_anomaly(True)
+#torch.autograd.set_detect_anomaly(True)
 torch.set_printoptions(threshold=10_000, sci_mode=False)
 
 def save_checkpoint(epoch, model, optimizer, losses, checkpoint_dir='checkpoints'):
@@ -65,10 +64,10 @@ args = parser.parse_args()
 learning_rate = .005
 num_epochs = 40000
 
-optim = torch.optim.Adam
+optim = torch.optim.RMSprop
 optim_args = {
     "lr": learning_rate,
-    "fused": True,
+    #"fused": True,
     #"rho": 0.95,
 }
 
@@ -86,7 +85,6 @@ else:
     else:
         start_epoch = 0
 
-#optimizer = optim(base_layers, **optim_args)
 param_count = sum(param.numel() for param in base_layers)
 print("Parameters:", param_count)
 

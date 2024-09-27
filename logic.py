@@ -11,6 +11,7 @@ def normalize_layers(layers, dropout):
             extended = torch.nn.functional.dropout(extended, dropout)
         normalized = torch.nn.functional.normalize(extended, p=1, dim=1)
         new_layers.append(normalized)
+        #new_layers.append(extended)
     return new_layers
 
 def compute_gate_results(i1, i2):
@@ -20,22 +21,48 @@ def compute_gate_results(i1, i2):
     NOT = 1 - i1[3]
     return torch.stack([AND, OR, XOR, NOT], dim=1)
 
-def evaluate_instance(original_layers, num_gates: int, generate_inputs_fn: callable, correct_behavior_fn: callable, dropout: float = .0, input_len: int = 8) -> torch.Tensor:
+def evaluate_instance(
+        original_layers,
+        num_gates: int,
+        generate_inputs_fn: callable,
+        correct_behavior_fn: callable,
+        dropout: float = .0,
+        input_len: int = 8
+    ) -> tuple[torch.Tensor, torch.Tensor]:
     layers = normalize_layers(original_layers, dropout)
-    input1s, input2s = layers[::2], layers[1::2]
 
     NUM_TESTS = 128
 
-    sample_inputs = torch.tensor(generate_inputs_fn(NUM_TESTS), dtype=torch.float32, device=input1s[0].device)
+    sample_inputs = torch.tensor(generate_inputs_fn(NUM_TESTS), dtype=torch.float32, device=layers[0].device)
     outputs = sample_inputs
 
     for i in range(num_gates):
-        i1, i2 = torch.matmul(input1s[i], outputs.T), torch.matmul(input2s[i], outputs.T)
+        V = layers[i]
+        batch_size, n = V.shape
+
+        # Generate pair probabilities
+        V_reshaped = V.unsqueeze(-1)
+        M = torch.bmm(V_reshaped, V_reshaped.transpose(1, 2))
+
+        # Remove double-connections
+        mask = torch.ones_like(M, device=V.device) - torch.eye(n, device=V.device).unsqueeze(0).expand(batch_size, -1, -1)
+        M = M * mask
+        M = torch.nn.functional.normalize(M, p=1, dim=(1,2))
+    
+        O = outputs
+        O_reshaped = O.unsqueeze(-1).unsqueeze(0).repeat(M.shape[0],1,1,O.shape[-1])
+
         if i == num_gates-1:
-            gate_results = i1 + i2 - i1 * i2  # Make outputs OR gates
-            gate_results = gate_results.swapaxes(0,1)
+            i1 = O_reshaped
+            i2 = O_reshaped.transpose(2, 3)
+            N = i1 * i2  # Make outputs AND gates
+            N = N.swapaxes(0,1)
         else:
-            gate_results = compute_gate_results(i1, i2)
+            N = compute_gate_results(O_reshaped, O_reshaped.transpose(2, 3))
+
+        result_mat = N * M.unsqueeze(0).repeat(N.shape[0],1,1,1)
+        gate_results = torch.sum(result_mat, dim=(2,3))
+
         outputs = torch.cat((outputs, gate_results), dim=1)
     
 
@@ -45,13 +72,14 @@ def evaluate_instance(original_layers, num_gates: int, generate_inputs_fn: calla
     actual_outputs = outputs[-m:, -n:]
 
     #loss = torch.sum(torch.sum(torch.abs(actual_outputs - expected_outputs), dim=0) ** 2)
-    loss = torch.sum((actual_outputs - expected_outputs) ** 2)
+    #loss = torch.sum((actual_outputs - expected_outputs) ** 2)
     #loss = torch.sum(torch.sigmoid(8*(torch.abs(actual_outputs-expected_outputs) - 1)))
     #loss = torch.sum(torch.abs(actual_outputs - expected_outputs) ** 3)
+    loss = torch.sum((-torch.log(1-torch.abs(expected_outputs - actual_outputs))))
 
     # penalize gates that are between 0 and 1
-    #all_layers = torch.cat(layers[1:], dim=1)
-    #loss = loss + torch.sum(gate_probs*(1-gate_probs)) + torch.sum(all_layers*(1-all_layers))
+    #all_layers = torch.cat(layers, dim=1)
+    #loss = loss + torch.sum(all_layers*(1-all_layers))
 
     return loss, torch.sum((actual_outputs - expected_outputs) ** 2)
 
