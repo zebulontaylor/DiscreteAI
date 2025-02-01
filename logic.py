@@ -5,7 +5,7 @@ import torch
 def normalize_layers(layers, dropout):
     new_layers = []
     for layer in layers:
-        clamped = torch.sigmoid(5 * (layer - 0.5))
+        clamped = torch.sigmoid(5 * (layer - 0.5))**2
         extended = torch.cat([clamped, torch.clamp(1 - torch.sum(clamped, dim=1), 0, 1).unsqueeze(1)], dim=1)
         if dropout:
             extended = torch.nn.functional.dropout(extended, dropout)
@@ -19,7 +19,7 @@ def compute_gate_results(i1, i2):
     OR = i1[1] + i2[1] - i1[1] * i2[1]
     XOR = i2[2] + i1[2] - 2 * i1[2] * i2[2]
     NOT = 1 - i1[3]
-    return torch.stack([AND, OR, XOR, NOT], dim=1)
+    return torch.stack([AND, OR, XOR, NOT], dim=1).to(i1.device)
 
 def evaluate_instance(
         original_layers,
@@ -71,11 +71,11 @@ def evaluate_instance(
     n = expected_outputs.shape[1]
     actual_outputs = outputs[-m:, -n:]
 
-    #loss = torch.sum(torch.sum(torch.abs(actual_outputs - expected_outputs), dim=0) ** 2)
+    loss = torch.sum(torch.sum(torch.abs(actual_outputs - expected_outputs), dim=0) ** 2)
     #loss = torch.sum((actual_outputs - expected_outputs) ** 2)
     #loss = torch.sum(torch.sigmoid(8*(torch.abs(actual_outputs-expected_outputs) - 1)))
     #loss = torch.sum(torch.abs(actual_outputs - expected_outputs) ** 3)
-    loss = torch.sum((-torch.log(1-torch.abs(expected_outputs - actual_outputs))))
+    #loss = torch.sum((-torch.log(1-torch.abs(expected_outputs - actual_outputs))))
 
     # penalize gates that are between 0 and 1
     #all_layers = torch.cat(layers, dim=1)
