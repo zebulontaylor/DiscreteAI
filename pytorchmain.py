@@ -12,15 +12,15 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 print(f"Running pytorch on {'cuda' if torch.cuda.is_available() else 'cpu'}.")
 
-num_gates = 20
-num_gate_types = 4
+num_gates = 48
+num_gate_types = 1
 num_possible_inputs = num_gates + 8  # 2 inputs, 4 bits each
 
 def create_model():
     base_layers = []
     for i in range(num_gates):
-        valid_inputs = i*4 + 8
-        base_layers.append(torch.rand((num_gate_types, valid_inputs-1), dtype=torch.float32, device=device, requires_grad=True))
+        valid_inputs = i*num_gate_types + 8
+        base_layers.append(torch.rand((num_gate_types, valid_inputs, 2), dtype=torch.float32, device=device, requires_grad=True))
     return base_layers
 
 losses = []
@@ -61,7 +61,7 @@ parser.add_argument('--checkpoint', type=str, default=None, help="Path to a chec
 parser.add_argument('--new', action='store_true', help="Start a new model from scratch")
 args = parser.parse_args()
 
-learning_rate = .005
+learning_rate = .0001
 num_epochs = 40000
 
 optim = torch.optim.RMSprop
@@ -95,7 +95,7 @@ for epoch in (pbar := trange(start_epoch, num_epochs, desc="Training Epochs")):
 
     loss.backward()
 
-    torch.nn.utils.clip_grad_norm_(base_layers, max_norm=1.0)
+    torch.nn.utils.clip_grad_norm_(base_layers, max_norm=.5)
 
     optimizer.step()
 
