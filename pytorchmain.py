@@ -1,115 +1,125 @@
-# main.py
-import torch
-from tqdm import tqdm, trange
-from logic import evaluate_instance, correct_behavior, generate_inputs
-from parser import parse_gate_configuration, create_graph
-from pprint import pprint
-import json
+# pytorchmain.py
+
 import os
+import json
 import argparse
+from pprint import pprint
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import torch
+from tqdm import trange
 
-print(f"Running pytorch on {'cuda' if torch.cuda.is_available() else 'cpu'}.")
+from logic import evaluate_instance, correct_behavior, generate_inputs, loss_hard
 
-num_gates = 48
-num_gate_types = 1
-num_possible_inputs = num_gates + 8  # 2 inputs, 4 bits each
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+NUM_GATES = 48
+NUM_GATE_TYPES = 1
+LEARNING_RATE = 1e-1
+NUM_EPOCHS = 100000
+CHECKPOINT_DIR = 'checkpoints'
+
 
 def create_model():
-    base_layers = []
-    for i in range(num_gates):
-        valid_inputs = i*num_gate_types + 8
-        base_layers.append(torch.rand((num_gate_types, valid_inputs, 2), dtype=torch.float32, device=device, requires_grad=True))
-    return base_layers
+    """Initialize model layers with random weights."""
+    layers = []
+    for i in range(NUM_GATES):
+        valid_inputs = i * NUM_GATE_TYPES + 8
+        layer = torch.rand(
+            (NUM_GATE_TYPES, valid_inputs, 2),
+            dtype=torch.float32,
+            device=DEVICE,
+            requires_grad=True
+        )
+        layers.append(layer)
+    return layers
 
-losses = []
 
-#torch.autograd.set_detect_anomaly(True)
-torch.set_printoptions(threshold=10_000, sci_mode=False)
-
-def save_checkpoint(epoch, model, optimizer, losses, checkpoint_dir='checkpoints'):
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_{epoch}.pth')
+def save_checkpoint(epoch, model, optimizer, losses):
+    """Save training state to a checkpoint file."""
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    path = os.path.join(CHECKPOINT_DIR, f'checkpoint_{epoch}.pth')
     torch.save({
         'epoch': epoch,
         'model_state_dict': [layer.detach().cpu() for layer in model],
         'optimizer_state_dict': optimizer.state_dict(),
         'losses': losses
-    }, checkpoint_path)
-    tqdm.write(f"Checkpoint saved at epoch {epoch}: {losses[-1]}")
+    }, path)
+    print(f"Checkpoint saved: epoch {epoch}, loss {losses[-1]:.4f}")
 
-def load_checkpoint(checkpoint_path, model, optimizer):
-    checkpoint = torch.load(checkpoint_path)
-    start_epoch = checkpoint['epoch']
-    model_state_dicts = checkpoint['model_state_dict']
-    if len(model) != len(model_state_dicts):
-        raise ValueError("Checkpoint model size does not match the current model size.")
-    for layer, state_dict in zip(model, model_state_dicts):
-        if layer.size() != state_dict.size():
-            raise ValueError("Checkpoint layer size does not match the current model layer size.")
-        layer.copy_(state_dict.to(device))
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    losses = checkpoint['losses']
-    print(f"Checkpoint loaded from epoch {start_epoch}")
-    return start_epoch, losses
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Train a model with optional checkpoint loading.")
-parser.add_argument('--checkpoint', type=str, default=None, help="Path to a checkpoint to load")
-parser.add_argument('--new', action='store_true', help="Start a new model from scratch")
-args = parser.parse_args()
+def load_checkpoint(path, model, optimizer):
+    """Load training state from a checkpoint file."""
+    ckpt = torch.load(path, map_location=DEVICE)
+    start_epoch = ckpt['epoch']
+    state_dicts = ckpt['model_state_dict']
+    if len(state_dicts) != len(model):
+        raise ValueError("Model size mismatch.")
+    for layer, state in zip(model, state_dicts):
+        if layer.size() != state.size():
+            raise ValueError("Layer size mismatch.")
+        layer.copy_(state.to(DEVICE))
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    print(f"Checkpoint loaded: resume from epoch {start_epoch}")
+    return start_epoch, ckpt['losses']
 
-learning_rate = .0001
-num_epochs = 40000
 
-optim = torch.optim.RMSprop
-optim_args = {
-    "lr": learning_rate,
-    #"fused": True,
-    #"rho": 0.95,
-}
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train a PyTorch model for gate configuration inference."
+    )
+    parser.add_argument(
+        '--checkpoint', type=str,
+        help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        '--new', action='store_true',
+        help="Ignore checkpoint and start a new model"
+    )
+    return parser.parse_args()
 
-if args.new or not args.checkpoint:
-    base_layers = create_model()
-    losses = []
+
+def train(args):
+    """Run the training loop."""
+    print(f"Running on {'cuda' if DEVICE.type == 'cuda' else 'cpu'}")
+    model = create_model()
+    optimizer = torch.optim.RMSprop(model, lr=LEARNING_RATE)
     start_epoch = 0
-    optimizer = optim(base_layers, **optim_args)
-else:
-    base_layers = create_model()
-    optimizer = optim(base_layers, **optim_args)
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        with torch.no_grad():
-            start_epoch, losses = load_checkpoint(args.checkpoint, base_layers, optimizer)
-    else:
-        start_epoch = 0
+    losses = []
 
-param_count = sum(param.numel() for param in base_layers)
-print("Parameters:", param_count)
+    # Optionally load from checkpoint
+    if args.checkpoint and not args.new and os.path.exists(args.checkpoint):
+        start_epoch, losses = load_checkpoint(args.checkpoint, model, optimizer)
 
-for epoch in (pbar := trange(start_epoch, num_epochs, desc="Training Epochs")):
-    optimizer.zero_grad(set_to_none=True)
+    # Training loop with progress bar
+    pbar = trange(start_epoch, NUM_EPOCHS, desc='Training')
+    for epoch in pbar:
+        optimizer.zero_grad(set_to_none=True)
+        loss, mse = evaluate_instance(
+            model, NUM_GATES, generate_inputs, correct_behavior
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model, max_norm=0.5)
+        optimizer.step()
 
-    loss, mse = evaluate_instance(base_layers, num_gates, generate_inputs, correct_behavior, dropout=.0)
+        hard_mse = loss_hard(
+            model, NUM_GATES, generate_inputs, correct_behavior
+        )
+        pbar.set_postfix({'mse': mse.item(), 'hard_mse': hard_mse.item()})
 
-    loss.backward()
+        if epoch % 50 == 0 and epoch != start_epoch:
+            losses.append(loss.item())
+            save_checkpoint(epoch, model, optimizer, losses)
 
-    torch.nn.utils.clip_grad_norm_(base_layers, max_norm=.5)
+    # Final outputs
+    print("Final instance (gate_probs):")
+    pprint(model[0])
+    pprint(losses)
 
-    optimizer.step()
 
-    grad_magn = 0
-    for param in base_layers:
-        grad_magn += torch.sum(torch.abs(param.grad))
+def main():
+    args = parse_args()
+    train(args)
 
-    pbar.set_description(f"Epoch {epoch}: mse = {mse.item():.4f}; grad magn.: {grad_magn:.4f}")
 
-    if epoch % 50 == 0 and epoch != start_epoch:
-        losses.append(loss.item())
-        with open("output.json", "w") as f:
-            f.write(json.dumps(parse_gate_configuration(base_layers, num_gates, num_gate_types)))
-        save_checkpoint(epoch, base_layers, optimizer, losses)
-
-print("Final Instance (gate_probs):\n", base_layers[0])
-pprint(losses)
+if __name__ == '__main__':
+    main()

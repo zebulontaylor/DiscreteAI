@@ -1,4 +1,7 @@
 checkpoints/*
+predictive_checkpoints/*
+predictive_checkpoints_adder/*
+predictive_checkpoints_AND/*
 ai/
 
 # Byte-compiled / optimized / DLL files
