@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CyclicLR
 
 # Constants
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-NUM_GATES = 48
+NUM_GATES = 64
 NUM_GATE_TYPES = 1
 LEARNING_RATE = 1e-1
 NUM_EPOCHS = 30000
