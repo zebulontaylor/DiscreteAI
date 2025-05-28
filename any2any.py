@@ -3,21 +3,27 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-from tqdm import trange
+from tqdm import tqdm, trange
 from unifiedbackprop import (
     DEVICE, NUM_GATES, generate_inputs, correct_behavior,
     compute_nand, hinge_overlap_loss, LEARNING_RATE,
     NUM_EPOCHS, CHECKPOINT_DIR, save_checkpoint
 )
-from torch.optim.lr_scheduler import CyclicLR
+import wandb
+import dotenv
+
+dotenv.load_dotenv()
 
 # Configuration
-INPUT_LEN = 8    # Number of original input bits
+INPUT_LEN = 8 # Number of original input bits
 OUTPUT_LEN = INPUT_LEN // 2  # Number of output bits
-NUM_ITER = 128     # Number of iterations for signal propagation
-CYCLE_WEIGHT = 1e2  # Weight for cycle-penalty regularization
+NUM_ITER = NUM_GATES+1 # Number of iterations for signal propagation
+CYCLE_WEIGHT = 1e1  # Weight for cycle-penalty regularization
 # Curriculum learning: threshold to advance output bits
-BIT_LOSS_THRESHOLD = 20
+HARD_LOSS_THRESHOLD = 1
+TAU = 1.0
+USE_GUMBEL = True
+USE_FREEZE = False
 
 
 def create_graph_model(input_len=INPUT_LEN, num_gates=NUM_GATES, num_gate_types=1):
@@ -82,6 +88,11 @@ def evaluate_graph(
     a_probs = probs[..., 0]
     b_probs = probs[..., 1]
     M = a_probs.unsqueeze(2) * b_probs.unsqueeze(1)
+    # Disallow outgoing connections from output gates: zero contributions where features correspond to output gates
+    mask = torch.ones((total_dim, total_dim), device=device)
+    mask[input_len:input_len+OUTPUT_LEN, :] = 0
+    mask[:, input_len:input_len+OUTPUT_LEN] = 0
+    M = M * mask.unsqueeze(0)
 
     # Propagate signals (vectorized)
     for _ in range(num_iterations):
@@ -97,12 +108,9 @@ def evaluate_graph(
         expected = expected[:, :target_bits]
         actual = actual[:, :target_bits]
 
-    # mean squared error for monitoring
-    diff = actual - expected
-    mse = diff.pow(2).sum()
     # binary cross-entropy loss (clamped to avoid log(0))
     bce = F.binary_cross_entropy(actual.clamp(min=1e-7, max=1-1e-7), expected, reduction='sum')
-    return bce, mse
+    return bce
 
 
 def loss_hard_graph(
@@ -129,6 +137,11 @@ def loss_hard_graph(
     a_hard[idx, a_idx] = 1.0
     b_hard[idx, b_idx] = 1.0
     M_hard = a_hard.unsqueeze(2) * b_hard.unsqueeze(1)  # [num_gates, total_dim, total_dim]
+    # Disallow outgoing connections from output gates: zero contributions where features correspond to output gates
+    mask = torch.ones((total_dim, total_dim), device=device)
+    mask[input_len:input_len+OUTPUT_LEN, :] = 0
+    mask[:, input_len:input_len+OUTPUT_LEN] = 0
+    M_hard = M_hard * mask.unsqueeze(0)
 
     # Sample inputs and initialize state
     inputs_np = generate_inputs_fn(num_tests)
@@ -161,7 +174,7 @@ def loss_hard_graph(
 # Add Gumbel-Softmax selection loss function
 def loss_gumbel_graph(
     layers_logits, num_iterations, generate_inputs_fn, correct_behavior_fn,
-    input_len=INPUT_LEN, num_tests=256, target_bits=None, tau=1.0, hard=False
+    input_len=INPUT_LEN, num_tests=256, target_bits=None, tau=TAU, hard=False
 ):
     """
     Gumbel-Softmax selection loss for the graph: discrete connections via Gumbel-Softmax and iterative propagation.
@@ -178,6 +191,11 @@ def loss_gumbel_graph(
     a_hard = samples[:, 0, :]  # [num_gates, total_dim]
     b_hard = samples[:, 1, :]  # [num_gates, total_dim]
     M_gumbel = a_hard.unsqueeze(2) * b_hard.unsqueeze(1)  # [num_gates, total_dim, total_dim]
+    # Disallow outgoing connections from output gates: zero contributions where features correspond to output gates
+    mask = torch.ones((total_dim, total_dim), device=device)
+    mask[input_len:input_len+OUTPUT_LEN, :] = 0
+    mask[:, input_len:input_len+OUTPUT_LEN] = 0
+    M_gumbel = M_gumbel * mask.unsqueeze(0)
 
     # Sample inputs and initialize state
     inputs_np = generate_inputs_fn(num_tests)
@@ -199,61 +217,121 @@ def loss_gumbel_graph(
     if target_bits is not None and target_bits < OUTPUT_LEN:
         expected = expected[:, :target_bits]
         actual = actual[:, :target_bits]
-    diff = actual - expected
-    mse = diff.pow(2).sum()
-    bce = F.binary_cross_entropy(actual.clamp(min=1e-7, max=1-1e-7), expected, reduction='sum')
-    return bce, mse
 
+    bce = F.binary_cross_entropy(actual.clamp(min=1e-7, max=1-1e-7), expected, reduction='sum')
+    return bce
+
+# Helper function to freeze gates upstream of a resolved output bit
+def freeze_upstream_gates(layers_logits, input_len, target_gate_idx):
+    """
+    Freeze parameters (requires_grad=False) for all gates upstream of the specified gate index,
+    including the gate itself.
+    """
+    stacked = torch.cat(layers_logits, dim=0)
+    probs = torch.softmax(stacked, dim=1)
+    a_probs = probs[..., 0]
+    b_probs = probs[..., 1]
+    a_idx = a_probs.argmax(dim=1)
+    b_idx = b_probs.argmax(dim=1)
+
+    upstream = set()
+    stack = [target_gate_idx]
+    while stack:
+        idx = stack.pop()
+        if idx in upstream:
+            continue
+        upstream.add(idx)
+        for parent in (a_idx[idx].item(), b_idx[idx].item()):
+            if parent >= input_len:
+                stack.append(parent - input_len)
+
+    # Exclude output gates (first OUTPUT_LEN gates) from freezing
+    upstream = {idx for idx in upstream if idx >= OUTPUT_LEN}
+
+    for idx in upstream:
+        layer = layers_logits[idx]
+        with torch.no_grad():
+            layer.fill_(-1e9)
+            layer[..., a_idx[idx], 0] = +1e9
+            layer[..., b_idx[idx], 1] = +1e9
+        layer.requires_grad_(False)
+
+    tqdm.write(f"Froze {len(upstream)} gates upstream of output bit {target_gate_idx}")
 
 def train():
-    print(f"Running any2any on {'cuda' if DEVICE.type == 'cuda' else 'cpu'}")
+    run = wandb.init(project="nandai", config={
+        "learning_rate": LEARNING_RATE,
+        "num_gates": NUM_GATES,
+        "num_iterations": NUM_ITER,
+        "cycle_weight": CYCLE_WEIGHT,
+        "hard_loss_threshold": HARD_LOSS_THRESHOLD,
+        "tau": TAU,
+        "use_gumbel": USE_GUMBEL,
+        "any2any": True,
+        "use_freeze": USE_FREEZE
+    })
+
+    tqdm.write(f"Running any2any on {'cuda' if DEVICE.type == 'cuda' else 'cpu'}")
+
     # Initialize curriculum to train on LSB first
     current_bits = 1
-    print(f"Curriculum: training on first {current_bits} output bit(s)")
+    tqdm.write(f"Curriculum: training on first {current_bits} output bit(s)")
     model = create_graph_model()
     optimizer = torch.optim.RMSprop(model, lr=LEARNING_RATE)
-    # set up cyclical learning rate scheduler (triangular)
-    scheduler = CyclicLR(
-        optimizer,
-        base_lr=LEARNING_RATE/10,
-        max_lr=LEARNING_RATE,
-        step_size_up=800,
-        mode='triangular',
-        cycle_momentum=False
-    )
 
     pbar = trange(0, NUM_EPOCHS, desc=f'Training(bits={current_bits})')
     for epoch in pbar:
         optimizer.zero_grad(set_to_none=True)
         # Evaluate loss using Gumbel-Softmax selection on current curriculum bits
-        loss, mse = loss_gumbel_graph(
-            model, NUM_ITER, generate_inputs, correct_behavior,
-            target_bits=current_bits
-        )
-        # Advance curriculum if threshold reached
-        if loss.item() < BIT_LOSS_THRESHOLD * current_bits and current_bits < OUTPUT_LEN:
-            current_bits += 1
-            print(f"Threshold reached: advancing to first {current_bits} output bit(s)")
-        
-        # soft hinge-overlap regularization (max one shared input) and cycle penalty
-        div_loss = hinge_overlap_loss(model)
-        cyc = cycle_penalty(model)
-        total_loss = loss + div_loss + cyc
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model, max_norm=0.5)
-        optimizer.step()
-        # update learning rate
-        scheduler.step()
+        if USE_GUMBEL:
+            loss = loss_gumbel_graph(
+                model, NUM_ITER, generate_inputs, correct_behavior,
+                target_bits=current_bits
+            )
+        else:
+            loss = evaluate_graph(
+                model, NUM_ITER, generate_inputs, correct_behavior,
+                target_bits=current_bits
+            )
 
         with torch.no_grad():
             hard_mse = loss_hard_graph(model, NUM_ITER, generate_inputs, correct_behavior, target_bits=current_bits)
-        pbar.set_description(f'Training(bits={current_bits}) - MSE: {mse.item():7.3f}, Hard Loss: {hard_mse.item():.1f}')
+        
+        # Advance curriculum if threshold reached
+        if hard_mse.item() < HARD_LOSS_THRESHOLD and current_bits < OUTPUT_LEN:
+            # Freeze gates upstream of the just-solved output bit
+            if USE_FREEZE:
+                freeze_upstream_gates(model, INPUT_LEN, current_bits - 1)
+            current_bits += 1
+            tqdm.write(f"Threshold reached: advancing to first {current_bits} output bit(s)")
+
+            with torch.no_grad():
+                hard_mse = loss_hard_graph(model, NUM_ITER, generate_inputs, correct_behavior, target_bits=current_bits)
+
+        div_loss = hinge_overlap_loss(model)
+        cyc = cycle_penalty(model)
+        total_loss = loss + cyc + div_loss
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model, max_norm=0.5)
+        optimizer.step()
+
+        run.log({
+            "loss": loss.item(),
+            "hard_loss": hard_mse.item(),
+            "current_bits": current_bits
+        })
+
+        pbar.set_description(f'Training(bits={current_bits}) - BCE: {loss.item():7.3f}, Hard Loss: {hard_mse.item():5.1f}, Div Loss: {div_loss.item():4.1f}, Cycle Loss: {cyc.item():4.1f}')
 
         if epoch % 50 == 0:
             save_checkpoint(epoch, model, optimizer, [total_loss.item()])
+        
+        if hard_mse.item() < HARD_LOSS_THRESHOLD and current_bits == OUTPUT_LEN:
+            run.finish()
+            break
 
     print("Training complete")
-    print("Example layer logits:", model[0])
 
 if __name__ == '__main__':
-    train() 
+    train()

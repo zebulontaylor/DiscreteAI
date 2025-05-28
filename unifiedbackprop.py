@@ -14,11 +14,11 @@ from torch.optim.lr_scheduler import CyclicLR
 
 # Constants
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-NUM_GATES = 96
+NUM_GATES = 48
 NUM_GATE_TYPES = 1
 LEARNING_RATE = 1e-1
 NUM_EPOCHS = 30000
-DIVERSITY_WEIGHT = 1e1
+DIVERSITY_WEIGHT = 1e-1
 CHECKPOINT_DIR = 'checkpoints'
 
 # --- Logic Functions ---
@@ -143,27 +143,6 @@ def loss_hard(
     mse_hard = diff.pow(2).sum()
     return mse_hard
 
-'''
-def diversity_loss(layers_logits, weight=DIVERSITY_WEIGHT):
-    """
-    Compute diversity regularization to penalize similar gates within each layer.
-    """
-    div_loss = 0.0
-    for layer in layers_logits:
-        # Normalize probabilities across inputs for each gate type
-        probs = torch.softmax(layer, dim=1)  # (NUM_GATE_TYPES, valid_inputs, 2)
-        T, V, C = probs.shape
-        # Flatten distributions for each gate type
-        flat = probs.view(T, V * C)
-        # Gram matrix of similarities
-        G = flat @ flat.T
-        I = torch.eye(T, device=G.device)
-        # Penalize off-diagonal similarities
-        div_loss += ((G - I).pow(2).sum())
-    return weight * div_loss
-'''
-
-# add hinge_overlap_loss soft-penalty variant (option 1)
 def hinge_overlap_loss(layers, max_shared=1, weight=DIVERSITY_WEIGHT):
     """
     Soft-penalty: for each pair of gates i≠j, compute their dot-product
@@ -219,7 +198,9 @@ def load_checkpoint(path, model, optimizer):
     for layer, state in zip(model, state_dicts):
         if layer.size() != state.size():
             raise ValueError("Layer size mismatch.")
-        layer.copy_(state.to(DEVICE))
+        # perform in-place update without gradient tracking
+        with torch.no_grad():
+            layer.copy_(state.to(DEVICE))
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     tqdm.write(f"Checkpoint loaded: resume from epoch {start_epoch}")
     return start_epoch, ckpt['losses']
